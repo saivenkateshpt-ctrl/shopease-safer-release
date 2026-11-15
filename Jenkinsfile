@@ -1,4 +1,4 @@
-// LAB 3: + manual approval and production deploy
+// LAB 4: + automatic rollback (final pipeline)
 def deploy(String name, int port, String image, boolean bad) {
     def version = image.tokenize(':')[1]
     sh "docker rm -f ${name} || true"
@@ -35,6 +35,10 @@ pipeline {
         disableConcurrentBuilds()
     }
 
+    parameters {
+        booleanParam(name: 'SIMULATE_BAD_RELEASE', defaultValue: false, description: 'Tick to simulate a release that passes all tests but is unhealthy in production')
+    }
+
     environment {
         IMAGE = "shopease/order-service:${BUILD_NUMBER}"
     }
@@ -60,10 +64,32 @@ pipeline {
             }
         }
         stage('Deploy to Production') {
-            steps { script { deploy('shopease-prod', 8082, env.IMAGE, false) } }
+            steps {
+                script {
+                    def previous = sh(script: "docker inspect --format '{{.Config.Image}}' shopease-prod 2>/dev/null || true", returnStdout: true).trim()
+                    env.PREVIOUS_IMAGE = previous ?: 'none'
+                    echo 'Production currently runs: ' + env.PREVIOUS_IMAGE
+                    deploy('shopease-prod', 8082, env.IMAGE, params.SIMULATE_BAD_RELEASE == true)
+                }
+            }
         }
         stage('Verify Production') {
-            steps { script { smoke('shopease-prod') } }
+            steps {
+                script {
+                    try {
+                        smoke('shopease-prod')
+                    } catch (err) {
+                        echo 'Production is UNHEALTHY - rolling back automatically'
+                        if (env.PREVIOUS_IMAGE == 'none') {
+                            error('Nothing to roll back to. Escalate to the on-call engineer now.')
+                        }
+                        deploy('shopease-prod', 8082, env.PREVIOUS_IMAGE, false)
+                        smoke('shopease-prod')
+                        env.ROLLED_BACK = 'true'
+                        error('Release failed. Production rolled back to ' + env.PREVIOUS_IMAGE)
+                    }
+                }
+            }
         }
     }
 
@@ -74,7 +100,11 @@ pipeline {
             sh 'docker image prune -f || true'
         }
         success { script { notifyTeam('SUCCESS') } }
-        failure { script { notifyTeam('FAILED') } }
+        failure {
+            script {
+                notifyTeam(env.ROLLED_BACK == 'true' ? 'FAILED - production rolled back to previous version' : 'FAILED')
+            }
+        }
         aborted { script { notifyTeam('ABORTED - not approved') } }
         cleanup { cleanWs() }
     }
